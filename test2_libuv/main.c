@@ -1,83 +1,120 @@
+/*
+ *  启动udp服务器的顺序，因为udp是不建立连接，所以没有uv_listen
+ *  1、初始化接收端的uv_udp_t: uv_udp_init(loop, &receive_socket_handle)
+ *  2、绑定地址：uv_udp_bind
+ *  3、开始接收消息：uv_udp_recv_start
+ *  4、uv_udp_recv_start里执行回调，可以使用下面方法回写数据发送给客户端
+ *    4.1、uv_udp_init初始化send_socket_handle
+ *    4.2、uv_udp_bind绑定发送者的地址，地址可以从recv获取
+ *    4.3、uv_udp_send发送指定消息
+ *  除了上述知识点外，本demo还是用到signal句柄。
+ */
+
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <uv.h>
+#include "common.h"
 
-#define DEFAULT_PORT 7000
-#define DEFAULT_BACKLOG 128
 
-uv_loop_t *loop;
-struct sockaddr_in addr;
+#define HOST "127.0.0.1"
+#define PORT 9999
 
-typedef struct {
-    uv_write_t req;
-    uv_buf_t buf;
-} write_req_t;
+ // receive套接字句柄
+static uv_udp_t receive_socket_handle;
 
-void free_write_req(uv_write_t *req) {
-    write_req_t *wr = (write_req_t*)req;
-    free(wr->buf.base);
-    free(wr);
-}
-
-void alloc_buffer(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
-    buf->base = (char*)malloc(suggested_size);
+void alloc_cb(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
+    buf->base = malloc(suggested_size);
     buf->len = suggested_size;
+    if (buf->base == NULL) {
+        printf("alloc_cb malloc buffer error\n");
+    }
 }
 
-void echo_write(uv_write_t *req, int status) {
-    if (status) {
-        fprintf(stderr, "Write error %s\n", uv_strerror(status));
-    }
-    free_write_req(req);
+void send_cb(uv_udp_send_t* req, int status) {
+    //  CHECK(status, "send_cb");
+    printf("callback.......");
+    //  free(req);
 }
 
-void echo_read(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
-    if (nread > 0) {
-        write_req_t *req = (write_req_t*)malloc(sizeof(write_req_t));
-        req->buf = uv_buf_init(buf->base, nread);
-        uv_write((uv_write_t*)req, client, &req->buf, 1, echo_write);
-        return;
-    }
+
+
+void receive_cb(uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf, const struct sockaddr *addr, unsigned int flags) {
+    int r = 0;
+    // 读数据包最重要的是判断nread这个字段
     if (nread < 0) {
-        if (nread != UV_EOF)
-            fprintf(stderr, "Read error %s\n", uv_err_name(nread));
-        uv_close((uv_handle_t*)client, NULL);
-    }
-
-    free(buf->base);
-}
-
-void on_new_connection(uv_stream_t *server, int status) {
-    if (status < 0) {
-        fprintf(stderr, "New connection error %s\n", uv_strerror(status));
-        // error!
+        // 因为udp不是使用stream形式，所以这里不需要使用uv_shutdown，直接调用uv_close
+        fprintf(stderr, "recv error unexpected\n");
+        uv_close((uv_handle_t *)handle, NULL);
+        free(buf->base);
         return;
     }
 
-    uv_tcp_t *client = (uv_tcp_t*)malloc(sizeof(uv_tcp_t));
-    uv_tcp_init(loop, client);
-    if (uv_accept(server, (uv_stream_t*)client) == 0) {
-        uv_read_start((uv_stream_t*)client, alloc_buffer, echo_read);
-    }
-    else {
-        uv_close((uv_handle_t*)client, NULL);
-    }
+    char sender[21] = { 0 };
+    uv_ip4_name((struct sockaddr_in*) addr, sender, 20);
+    fprintf(stderr, "recv from %s\n", sender);
+
+
+    uv_udp_t send_socket_handle;
+    uv_udp_send_t *send_req = malloc(sizeof(send_req));
+    uv_buf_t newBuf = uv_buf_init(buf->base, nread);
+    struct sockaddr_in client_addr;
+    r = uv_ip4_addr(sender, 60581, &client_addr);
+    // 反向发送消息给客户端
+  //   r = uv_udp_init(req->loop, &send_socket_handle);
+  //   CHECK(r, "uv_udp_init");
+  //   r = uv_udp_bind(&client_addr, addr, 0);
+  //   CHECK(r, "uv_udp_bind");
+
+    r = uv_udp_send(send_req, &send_socket_handle, &newBuf, nread, addr, send_cb);
+    CHECK(r, "uv_udp_send");
+    // r = uv_udp_recv_stop(handle)
+}
+
+void timer_cb(uv_timer_t *handle) {
+    uv_print_active_handles(handle->loop, stderr);
+}
+void signal_cb(uv_signal_t *handle, int signum) {
+    printf("signal_cb: recvd CTRL+C shutting down\n");
+    uv_stop(uv_default_loop()); //stops the event loop
 }
 
 int main() {
-    loop = uv_default_loop();
+    uv_loop_t *loop = uv_default_loop();
+    int r = 0;
 
-    uv_tcp_t server;
-    uv_tcp_init(loop, &server);
+    // 初始化udp句柄
+    r = uv_udp_init(loop, &receive_socket_handle);
+    CHECK(r, "uv_udp_init");
 
-    uv_ip4_addr("0.0.0.0", DEFAULT_PORT, &addr);
 
-    uv_tcp_bind(&server, (const struct sockaddr*)&addr, 0);
-    int r = uv_listen((uv_stream_t*)&server, DEFAULT_BACKLOG, on_new_connection);
-    if (r) {
-        fprintf(stderr, "Listen error %s\n", uv_strerror(r));
-        return 1;
-    }
-    return uv_run(loop, UV_RUN_DEFAULT);
+    // 初始化跨平台可用的ipv4地址
+    struct sockaddr_in addr;
+    r = uv_ip4_addr(HOST, PORT, &addr);
+    CHECK(r, "uv_ipv4_addr");
+
+    // 绑定
+    r = uv_udp_bind(&receive_socket_handle, (const struct sockaddr *) &addr, 0);
+    CHECK(r, "uv_udp_bind");
+
+    // 开始接收消息
+    r = uv_udp_recv_start(&receive_socket_handle, alloc_cb, receive_cb);
+    CHECK(r, "uv_udp_recv_start");
+
+    printf("udp server listen at %s:%d\n", HOST, PORT);
+
+
+    // 增加一个定时器去询问当前是不是一直有活跃的句柄，以此来验证某些观点
+    uv_timer_t timer_handle;
+    r = uv_timer_init(loop, &timer_handle);
+    CHECK(r, "uv_timer_init");
+
+    // 每10秒钟调用定时器回调一次
+    r = uv_timer_start(&timer_handle, timer_cb, 10 * 1000, 0);
+
+    // 增加signal的监听
+    uv_signal_t signal_handle;
+    r = uv_signal_init(loop, &signal_handle);
+    CHECK(r, "uv_signal_init");
+
+    r = uv_signal_start(&signal_handle, signal_cb, SIGINT);
+
+    uv_run(loop, UV_RUN_DEFAULT);
 }
