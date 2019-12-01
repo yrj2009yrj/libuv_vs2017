@@ -5,7 +5,8 @@
 
 #define CHECK(r, msg) if (r < 0) {                                                              \
     fprintf(stderr, "%s: [%s(%d): %s]\n", msg, uv_err_name((r)), (int) r, uv_strerror((r)));    \
-    exit(1);                                                                                    \
+    fprintf(stderr, "file: %s\n", __FILE__);                                                    \
+    fprintf(stderr, "function: %s\n", __FUNCTION__);                                            \
 }
 
 typedef struct context_struct {
